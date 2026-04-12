@@ -1,0 +1,29 @@
+[package]
+name = "skewguard"
+version = "0.1.0"
+edition = "2024"
+description = "Contention-adaptive concurrency control for transactional key-value workloads"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/lyang24/skewguard"
+keywords = ["concurrency", "transactions", "key-value", "database", "locking"]
+categories = ["concurrency", "database-implementations"]
+
+[features]
+default = []
+rocksdb = ["dep:rust-rocksdb"]
+
+[dependencies]
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+bytes = "1"
+rust-rocksdb = { version = "0.46", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.9"
+tempfile = "3"
+
+[[bench]]
+name = "ycsb"
+harness = false
