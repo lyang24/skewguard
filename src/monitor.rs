@@ -7,7 +7,7 @@ use std::time::Instant;
 /// The current execution mode of a key range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeMode {
-    /// Using pessimistic locking (or OCC).
+    /// Using pessimistic locking.
     Cold,
     /// Using group locking (batched serial execution).
     Hot,
@@ -39,7 +39,7 @@ pub enum MonitorStrategy {
         /// CIDER default: 2.
         hotness_threshold: u32,
         /// Credits added on each successful uncontended operation.
-        /// CIDER default: 2. (Additive increase for staying optimistic.)
+        /// CIDER default: 2. (Additive increase for staying in cold mode.)
         aimd_factor: i32,
     },
 }

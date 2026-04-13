@@ -209,22 +209,36 @@ txn.commit().unwrap();
 Implement the `Storage` trait to plug in any backend:
 
 ```rust
-use skewguard::storage::{Storage, Snapshot, WriteBatch, Timestamp};
-use skewguard::Result;
+use skewguard::{Storage, Snapshot, WriteBatch};
+
+// Timestamp is a u64 alias — use skewguard::storage::Timestamp
+// or just u64 directly.
+type Timestamp = u64;
 
 struct MyStorage { /* your state */ }
+struct MySnapshot { /* snapshot state */ }
+struct MyWriteBatch { /* buffered writes */ }
 
 impl Storage for MyStorage {
     type Snapshot = MySnapshot;
     type WriteBatch = MyWriteBatch;
 
-    fn snapshot(&self) -> MySnapshot { /* point-in-time view */ }
-    fn write_batch(&self) -> MyWriteBatch { /* empty batch */ }
-    fn commit(&self, batch: MyWriteBatch) -> Result<Timestamp> { /* atomic apply */ }
-    fn current_timestamp(&self) -> Timestamp { /* monotonic clock */ }
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<Vec<u8>>> { /* versioned read */ }
+    fn snapshot(&self) -> MySnapshot { todo!() }
+    fn write_batch(&self) -> MyWriteBatch { todo!() }
+    fn commit(&self, batch: MyWriteBatch) -> skewguard::Result<Timestamp> { todo!() }
+    fn current_timestamp(&self) -> Timestamp { todo!() }
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> skewguard::Result<Option<Vec<u8>>> { todo!() }
     fn was_modified(&self, key: &[u8], after: Timestamp, at_or_before: Timestamp)
-        -> Result<bool> { /* conflict check */ }
+        -> skewguard::Result<bool> { todo!() }
+}
+
+impl Snapshot for MySnapshot {
+    fn timestamp(&self) -> Timestamp { todo!() }
+}
+
+impl WriteBatch for MyWriteBatch {
+    fn put(&mut self, key: &[u8], value: &[u8]) { todo!() }
+    fn delete(&mut self, key: &[u8]) { todo!() }
 }
 ```
 

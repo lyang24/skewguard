@@ -86,7 +86,7 @@ impl<S: Storage> Transaction<S> {
     /// 1. `force_hot` option -> always group locking (abort-driven promotion)
     /// 2. Any touched range is Hot -> group locking
     /// 3. `declared_keys` provided and any declared range is Hot -> group locking
-    /// 4. Otherwise -> cold path (pessimistic or OCC per config)
+    /// 4. Otherwise -> cold path (pessimistic locking)
     pub fn commit(self) -> Result<()> {
         if self.rw_set.is_read_only() {
             return Ok(());
