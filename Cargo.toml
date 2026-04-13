@@ -8,6 +8,7 @@ readme = "README.md"
 repository = "https://github.com/lyang24/skewguard"
 keywords = ["concurrency", "transactions", "key-value", "database", "locking"]
 categories = ["concurrency", "database-implementations"]
+exclude = [".codex", "papers/", "docs/", "thesis/"]
 
 [features]
 default = []

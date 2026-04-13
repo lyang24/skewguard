@@ -233,7 +233,7 @@ impl Storage for MyStorage {
 Default config uses AIMD credits (zero tuning):
 
 ```rust
-use skewguard::{Config, ColdPathStrategy, MonitorStrategy};
+use skewguard::{Config, MonitorStrategy};
 
 // Default — self-tuning, no knobs to adjust.
 let config = Config::default();
@@ -245,8 +245,7 @@ let config = Config {
         hotness_threshold: 2,  // consecutive conflicts to trigger refill
         aimd_factor: 2,        // decay resistance for uncontended keys
     },
-    num_ranges: 64,                          // keyspace partitions for tracking
-    cold_path: ColdPathStrategy::Pessimistic, // what CockroachDB/TiDB use
+    num_ranges: 64,            // keyspace partitions for tracking
 };
 
 // Threshold-based alternative with explicit control.

@@ -60,7 +60,7 @@ impl RocksStorage {
     pub fn open_with_options<P: AsRef<Path>>(path: P, sync_writes: bool) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        opts.set_write_buffer_size(64 * 1024 * 1024);
         opts.set_max_write_buffer_number(3);
         opts.set_target_file_size_base(64 * 1024 * 1024);
         opts.set_level_zero_file_num_compaction_trigger(4);
@@ -68,11 +68,36 @@ impl RocksStorage {
 
         let db = DB::open(&opts, path).map_err(|e| Error::Storage(Box::new(e)))?;
 
+        // Recover the clock from persisted data. Scan for the highest
+        // timestamp in the DB so we never reuse a timestamp after restart.
+        // We set clock to max_ts + 2 because:
+        //   - max_ts is a write timestamp
+        //   - max_ts + 1 was the current_timestamp() after that write
+        //   - We need to start strictly after that to avoid confusion
+        let max_ts = Self::recover_max_timestamp(&db);
+
         Ok(RocksStorage {
             db,
-            clock: AtomicU64::new(1),
+            clock: AtomicU64::new(max_ts + 2),
             sync_writes,
         })
+    }
+
+    /// Scan the DB to find the highest persisted timestamp.
+    fn recover_max_timestamp(db: &DB) -> Timestamp {
+        let mut max_ts: Timestamp = 0;
+        let mut iter = db.raw_iterator();
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(k) = iter.key()
+                && let Some((_, ts)) = decode_key(k)
+                && ts > max_ts
+            {
+                max_ts = ts;
+            }
+            iter.next();
+        }
+        max_ts
     }
 
     fn tick(&self) -> Timestamp {
@@ -96,16 +121,17 @@ impl RocksStorage {
                 if !k.starts_with(&prefix) {
                     break;
                 }
-                if let Some((found_key, found_ts)) = decode_key(k) {
-                    if found_key == user_key && found_ts <= ts {
-                        // Found the latest version at or before ts.
-                        if let Some(v) = iter.value() {
-                            if v.is_empty() {
-                                // Empty value = tombstone (delete marker).
-                                return Ok(None);
-                            }
-                            return Ok(Some(v.to_vec()));
+                if let Some((found_key, found_ts)) = decode_key(k)
+                    && found_key == user_key
+                    && found_ts < ts
+                {
+                    // Found the latest version strictly before ts.
+                    if let Some(v) = iter.value() {
+                        if v.is_empty() {
+                            // Empty value = tombstone (delete marker).
+                            return Ok(None);
                         }
+                        return Ok(Some(v.to_vec()));
                     }
                 }
             }
@@ -166,7 +192,12 @@ impl storage::Storage for RocksStorage {
         self.get_at_internal(key, ts)
     }
 
-    fn was_modified(&self, user_key: &[u8], after: Timestamp, at_or_before: Timestamp) -> Result<bool> {
+    fn was_modified(
+        &self,
+        user_key: &[u8],
+        after: Timestamp,
+        at_or_before: Timestamp,
+    ) -> Result<bool> {
         let prefix = encode_prefix(user_key);
         // Seek to the version at at_or_before.
         let seek_key = encode_key(user_key, at_or_before);
@@ -179,14 +210,14 @@ impl storage::Storage for RocksStorage {
                 if !k.starts_with(&prefix) {
                     break;
                 }
-                if let Some((found_key, found_ts)) = decode_key(k) {
-                    if found_key == user_key {
-                        if found_ts >= after && found_ts <= at_or_before {
-                            return Ok(true);
-                        }
-                        if found_ts < after {
-                            break; // past our window
-                        }
+                if let Some((found_key, found_ts)) = decode_key(k)
+                    && found_key == user_key
+                {
+                    if found_ts >= after && found_ts <= at_or_before {
+                        return Ok(true);
+                    }
+                    if found_ts < after {
+                        break; // past our window
                     }
                 }
             }
@@ -204,34 +235,16 @@ pub struct RocksSnapshot {
 }
 
 impl storage::Snapshot for RocksSnapshot {
-    fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // RocksSnapshot only holds a logical timestamp, not a DB reference.
-        // Transaction::get() uses Storage::get_at(key, snapshot.timestamp())
-        // instead of calling this method. This exists to satisfy the Snapshot
-        // trait; callers should not use standalone snapshot reads with RocksDB.
-        unimplemented!(
-            "RocksSnapshot::get() is not supported; use Storage::get_at() with the snapshot timestamp"
-        )
-    }
-
     fn timestamp(&self) -> Timestamp {
         self.ts
     }
 }
 
 /// Write batch wrapper that buffers operations until commit.
+#[derive(Default)]
 pub struct RocksWriteBatchWrapper {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ts: Timestamp,
-}
-
-impl Default for RocksWriteBatchWrapper {
-    fn default() -> Self {
-        RocksWriteBatchWrapper {
-            ops: Vec::new(),
-            ts: 0,
-        }
-    }
 }
 
 impl storage::WriteBatch for RocksWriteBatchWrapper {
@@ -276,19 +289,24 @@ mod tests {
         // Write v1.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"v1");
-        let ts1 = store.commit(batch).unwrap();
+        store.commit(batch).unwrap();
+
+        // Snapshot after v1.
+        let after_v1 = store.current_timestamp();
 
         // Write v2.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"v2");
-        let ts2 = store.commit(batch).unwrap();
+        store.commit(batch).unwrap();
 
-        // Read at ts1 → v1.
-        let val = store.get_at(b"key", ts1).unwrap();
+        let after_v2 = store.current_timestamp();
+
+        // Read after v1 → v1 (strict less-than: sees writes before after_v1).
+        let val = store.get_at(b"key", after_v1).unwrap();
         assert_eq!(val, Some(b"v1".to_vec()));
 
-        // Read at ts2 → v2.
-        let val = store.get_at(b"key", ts2).unwrap();
+        // Read after v2 → v2.
+        let val = store.get_at(b"key", after_v2).unwrap();
         assert_eq!(val, Some(b"v2".to_vec()));
     }
 
@@ -314,18 +332,20 @@ mod tests {
 
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"val");
-        let ts1 = store.commit(batch).unwrap();
+        store.commit(batch).unwrap();
+        let after_write = store.current_timestamp();
 
         let mut batch = store.write_batch();
         storage::WriteBatch::delete(&mut batch, b"key");
-        let ts2 = store.commit(batch).unwrap();
+        store.commit(batch).unwrap();
+        let after_delete = store.current_timestamp();
 
-        // At ts1, key exists.
-        let val = store.get_at(b"key", ts1).unwrap();
+        // After write, key exists.
+        let val = store.get_at(b"key", after_write).unwrap();
         assert_eq!(val, Some(b"val".to_vec()));
 
-        // At ts2, key is deleted.
-        let val = store.get_at(b"key", ts2).unwrap();
+        // After delete, key is gone.
+        let val = store.get_at(b"key", after_delete).unwrap();
         assert_eq!(val, None);
     }
 
@@ -336,10 +356,49 @@ mod tests {
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"a", b"1");
         storage::WriteBatch::put(&mut batch, b"b", b"2");
-        let ts = store.commit(batch).unwrap();
+        store.commit(batch).unwrap();
 
+        let ts = store.current_timestamp();
         assert_eq!(store.get_at(b"a", ts).unwrap(), Some(b"1".to_vec()));
         assert_eq!(store.get_at(b"b", ts).unwrap(), Some(b"2".to_vec()));
         assert_eq!(store.get_at(b"c", ts).unwrap(), None);
+    }
+
+    #[test]
+    fn clock_survives_restart() {
+        // Bug #3 regression test: clock must recover from persisted data.
+        let dir = TempDir::new().unwrap();
+
+        // Write data, note the timestamp.
+        let ts_after_write;
+        {
+            let store = RocksStorage::open_with_options(dir.path(), false).unwrap();
+            let mut batch = store.write_batch();
+            storage::WriteBatch::put(&mut batch, b"key", b"value");
+            store.commit(batch).unwrap();
+            ts_after_write = store.current_timestamp();
+        }
+        // DB dropped here.
+
+        // Reopen — clock must be >= ts_after_write + 1 (past any persisted ts).
+        {
+            let store = RocksStorage::open_with_options(dir.path(), false).unwrap();
+            assert!(
+                store.current_timestamp() > ts_after_write,
+                "clock must recover: current {} should be > {}",
+                store.current_timestamp(),
+                ts_after_write,
+            );
+
+            // Old data must be readable.
+            let val = store.get_at(b"key", store.current_timestamp()).unwrap();
+            assert_eq!(val, Some(b"value".to_vec()));
+
+            // New writes must get higher timestamps.
+            let mut batch = store.write_batch();
+            storage::WriteBatch::put(&mut batch, b"key", b"v2");
+            let new_ts = store.commit(batch).unwrap();
+            assert!(new_ts > ts_after_write);
+        }
     }
 }

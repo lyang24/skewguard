@@ -1,12 +1,11 @@
+use crate::TransactionOptions;
 use crate::error::{Error, Result};
 use crate::group_lock::GroupLockRegistry;
 use crate::monitor::{ContentionMonitor, RangeMode};
 use crate::mvcc::{ReadWriteSet, WriteOp};
-use crate::occ;
 use crate::pessimistic::PessimisticLockManager;
 use crate::range::KeyRange;
-use crate::storage::{Snapshot, Storage, WriteBatch};
-use crate::{ColdPathStrategy, TransactionOptions};
+use crate::storage::{Snapshot, Storage, Timestamp};
 use std::sync::Arc;
 
 /// A transaction handle. Reads see a consistent MVCC snapshot.
@@ -16,10 +15,9 @@ pub struct Transaction<S: Storage> {
     monitor: Arc<ContentionMonitor>,
     registry: Arc<GroupLockRegistry>,
     lock_mgr: Arc<PessimisticLockManager>,
-    snapshot: S::Snapshot,
+    snapshot_ts: Timestamp,
     rw_set: ReadWriteSet,
     num_ranges: usize,
-    cold_path: ColdPathStrategy,
     options: TransactionOptions,
 }
 
@@ -31,23 +29,25 @@ impl<S: Storage> Transaction<S> {
         lock_mgr: Arc<PessimisticLockManager>,
         snapshot: S::Snapshot,
         num_ranges: usize,
-        cold_path: ColdPathStrategy,
         options: TransactionOptions,
     ) -> Self {
+        let snapshot_ts = snapshot.timestamp();
         Transaction {
             storage,
             monitor,
             registry,
             lock_mgr,
-            snapshot,
+            snapshot_ts,
             rw_set: ReadWriteSet::new(),
             num_ranges,
-            cold_path,
             options,
         }
     }
 
-    /// Read a key. Returns None if the key does not exist at the snapshot.
+    /// Read a key. Returns None if the key does not exist.
+    ///
+    /// Reads see a consistent point-in-time view as of the snapshot
+    /// timestamp. Writes committed after `begin()` are invisible.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let range = KeyRange::for_key(key, self.num_ranges);
 
@@ -59,10 +59,9 @@ impl<S: Storage> Transaction<S> {
             };
         }
 
-        // Read at the snapshot's timestamp via the storage backend.
-        // This works for both MemStorage (which clones data into the snapshot)
-        // and RocksDB (which reads from the DB at a logical timestamp).
-        let value = self.storage.get_at(key, self.snapshot.timestamp())?;
+        // Read at the snapshot timestamp. get_at returns the latest version
+        // strictly before snapshot_ts, so concurrent commits are invisible.
+        let value = self.storage.get_at(key, self.snapshot_ts)?;
         self.rw_set.record_read(key.to_vec(), range);
         Ok(value)
     }
@@ -84,10 +83,10 @@ impl<S: Storage> Transaction<S> {
     /// Commit the transaction.
     ///
     /// Path selection:
-    /// 1. `force_hot` option → always group locking (abort-driven promotion)
-    /// 2. Any touched range is Hot → group locking
-    /// 3. `declared_keys` provided and any declared range is Hot → group locking
-    /// 4. Otherwise → cold path (pessimistic or OCC per config)
+    /// 1. `force_hot` option -> always group locking (abort-driven promotion)
+    /// 2. Any touched range is Hot -> group locking
+    /// 3. `declared_keys` provided and any declared range is Hot -> group locking
+    /// 4. Otherwise -> cold path (pessimistic or OCC per config)
     pub fn commit(self) -> Result<()> {
         if self.rw_set.is_read_only() {
             return Ok(());
@@ -100,14 +99,11 @@ impl<S: Storage> Transaction<S> {
         }
     }
 
-    /// Determine whether this transaction should use the hot (group locking) path.
     fn should_use_hot_path(&self) -> bool {
-        // Abort-driven promotion: caller explicitly requested hot path.
         if self.options.force_hot {
             return true;
         }
 
-        // Check ranges touched by actual operations.
         let any_touched_hot = self
             .rw_set
             .ranges
@@ -117,14 +113,11 @@ impl<S: Storage> Transaction<S> {
             return true;
         }
 
-        // Check pre-declared keys (HDCC Rule 3: declared + hot → group locking).
         if let Some(ref keys) = self.options.declared_keys {
-            let any_declared_hot = keys
-                .iter()
-                .any(|k| {
-                    let range = KeyRange::for_key(k, self.num_ranges);
-                    self.monitor.mode(range) == RangeMode::Hot
-                });
+            let any_declared_hot = keys.iter().any(|k| {
+                let range = KeyRange::for_key(k, self.num_ranges);
+                self.monitor.mode(range) == RangeMode::Hot
+            });
             if any_declared_hot {
                 return true;
             }
@@ -133,18 +126,13 @@ impl<S: Storage> Transaction<S> {
         false
     }
 
-    /// Cold path: pessimistic locking or OCC depending on config.
     fn commit_cold(self) -> Result<()> {
-        // Clone what we need for monitoring before consuming self.
         let monitor = Arc::clone(&self.monitor);
         let ranges = self.rw_set.ranges.clone();
+        let snapshot_ts = self.snapshot_ts;
 
-        let result = match self.cold_path {
-            ColdPathStrategy::Pessimistic => self.commit_pessimistic(),
-            ColdPathStrategy::Occ => self.commit_occ(),
-        };
+        let result = self.commit_pessimistic(snapshot_ts);
 
-        // Record result for contention monitoring.
         match &result {
             Ok(()) => {
                 for range in &ranges {
@@ -162,41 +150,30 @@ impl<S: Storage> Transaction<S> {
         result
     }
 
-    /// Pessimistic locking commit path.
-    fn commit_pessimistic(self) -> Result<()> {
-        self.lock_mgr.execute(&*self.storage, &self.rw_set)
-    }
-
-    /// OCC commit path.
-    fn commit_occ(self) -> Result<()> {
-        let snapshot_ts = self.snapshot.timestamp();
-
-        let mut batch = self.storage.write_batch();
-        for (key, op) in &self.rw_set.writes {
-            match op {
-                WriteOp::Put(value) => batch.put(key, value),
-                WriteOp::Delete => batch.delete(key),
-            }
-        }
-
-        let commit_ts = self.storage.current_timestamp();
-        occ::validate(&*self.storage, &self.rw_set, snapshot_ts, commit_ts)?;
-        self.storage.commit(batch)?;
-        Ok(())
+    fn commit_pessimistic(self, snapshot_ts: Timestamp) -> Result<()> {
+        self.lock_mgr
+            .execute(&*self.storage, &self.rw_set, snapshot_ts)
     }
 
     /// Group locking commit path for hot ranges.
+    ///
+    /// Uses execute() on the coordinator which handles leader/follower
+    /// handoff with LeaderGuard safety. For multi-range transactions,
+    /// all keys go through a single coordinator (the first hot range's)
+    /// to avoid cross-coordinator deadlocks. This serializes multi-range
+    /// hot transactions but keeps them correct.
     fn commit_hot(self) -> Result<()> {
-        let hot_range = self
+        // Pick the coordinator. Use the first hot range, or the first
+        // range if force_hot with no range actually hot.
+        let coord_range = self
             .rw_set
             .ranges
             .iter()
             .find(|r| self.monitor.mode(**r) == RangeMode::Hot)
             .copied()
-            // If force_hot but no range is actually hot, use the first range.
             .unwrap_or(self.rw_set.ranges[0]);
 
-        let coordinator = self.registry.coordinator(hot_range);
+        let coordinator = self.registry.coordinator(coord_range);
         let result = coordinator.execute(&*self.storage, &self.rw_set);
 
         match &result {
@@ -220,12 +197,11 @@ impl<S: Storage> Transaction<S> {
 mod tests {
     use crate::mem::MemStorage;
     use crate::monitor::MonitorStrategy;
-    use crate::{ColdPathStrategy, Config, SkewGuard, TransactionOptions};
+    use crate::{Config, SkewGuard, TransactionOptions};
 
     #[test]
     fn basic_commit_pessimistic() {
         let config = Config {
-            cold_path: ColdPathStrategy::Pessimistic,
             ..Config::default()
         };
         let sg = SkewGuard::new(MemStorage::new(), config);
@@ -240,23 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn basic_commit_occ() {
-        let config = Config {
-            cold_path: ColdPathStrategy::Occ,
-            ..Config::default()
-        };
-        let sg = SkewGuard::new(MemStorage::new(), config);
-
-        let mut txn = sg.begin();
-        txn.put(b"key", b"val");
-        txn.commit().unwrap();
-
-        let mut txn2 = sg.begin();
-        let val = txn2.get(b"key").unwrap();
-        assert_eq!(val, Some(b"val".to_vec()));
-    }
-
-    #[test]
     fn read_own_writes() {
         let sg = SkewGuard::new(MemStorage::new(), Config::default());
 
@@ -264,6 +223,62 @@ mod tests {
         txn.put(b"key", b"val");
         let val = txn.get(b"key").unwrap();
         assert_eq!(val, Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_isolation_no_dirty_reads() {
+        // Bug #1 regression test: t1 should NOT see t2's write.
+        let sg = SkewGuard::new(MemStorage::new(), Config::default());
+
+        // Write initial value.
+        let mut txn = sg.begin();
+        txn.put(b"key", b"v1");
+        txn.commit().unwrap();
+
+        // t1 begins, takes snapshot.
+        let mut t1 = sg.begin();
+
+        // t2 writes a new value and commits.
+        let mut t2 = sg.begin();
+        t2.put(b"key", b"v2");
+        t2.commit().unwrap();
+
+        // t1 should still see v1, not v2.
+        let val = t1.get(b"key").unwrap();
+        assert_eq!(val, Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_detects_lost_update() {
+        // Bug #2 regression test: pessimistic path must detect read-write conflicts.
+        let config = Config {
+            ..Config::default()
+        };
+        let sg = SkewGuard::new(MemStorage::new(), config);
+
+        // Write initial value.
+        let mut txn = sg.begin();
+        txn.put(b"key", b"0");
+        txn.commit().unwrap();
+
+        // t1 reads key=0.
+        let mut t1 = sg.begin();
+        let _ = t1.get(b"key").unwrap();
+
+        // t2 writes key=2 and commits.
+        let mut t2 = sg.begin();
+        t2.put(b"key", b"2");
+        t2.commit().unwrap();
+
+        // t1 tries to write key=1 based on its stale read.
+        t1.put(b"key", b"1");
+        let result = t1.commit();
+
+        // Must abort — t1's read of key is stale.
+        assert!(
+            result.is_err(),
+            "pessimistic path should detect lost update"
+        );
     }
 
     #[test]
@@ -284,7 +299,6 @@ mod tests {
     fn force_hot_uses_group_locking() {
         let sg = SkewGuard::new(MemStorage::new(), Config::default());
 
-        // No range is hot, but force_hot bypasses the check.
         let opts = TransactionOptions {
             force_hot: true,
             ..Default::default()
@@ -300,34 +314,29 @@ mod tests {
 
     #[test]
     fn abort_driven_promotion() {
-        // Simulate: first attempt on OCC aborts, retry with force_hot succeeds.
-        let config = Config {
-            cold_path: ColdPathStrategy::Occ,
-            ..Config::default()
-        };
-        let sg = SkewGuard::new(MemStorage::new(), config);
+        // Pessimistic path detects stale read → abort.
+        // Retry with force_hot → group locking path succeeds.
+        let sg = SkewGuard::new(MemStorage::new(), Config::default());
 
-        // Write initial value to establish a baseline timestamp.
         let mut txn_init = sg.begin();
         txn_init.put(b"counter", b"0");
         txn_init.commit().unwrap();
 
-        // txn_a reads counter (takes snapshot at this point).
-        let mut txn_a = sg.begin();
-        let _ = txn_a.get(b"counter").unwrap();
+        // t1 reads counter (takes snapshot).
+        let mut t1 = sg.begin();
+        let _ = t1.get(b"counter").unwrap();
 
-        // txn_b writes counter AFTER txn_a's snapshot.
-        let mut txn_b = sg.begin();
-        txn_b.put(b"counter", b"2");
-        txn_b.commit().unwrap();
+        // t2 writes counter after t1's snapshot.
+        let mut t2 = sg.begin();
+        t2.put(b"counter", b"2");
+        t2.commit().unwrap();
 
-        // txn_a tries to update — OCC validation detects that counter was
-        // modified between txn_a's snapshot and now → conflict.
-        txn_a.put(b"counter", b"1");
-        let result = txn_a.commit();
-        assert!(result.is_err(), "OCC should detect conflict");
+        // t1 tries to update based on stale read → conflict.
+        t1.put(b"counter", b"1");
+        let result = t1.commit();
+        assert!(result.is_err(), "pessimistic should detect stale read");
 
-        // Retry with force_hot → group locking path, no OCC validation.
+        // Retry with force_hot → group locking, no read validation.
         let opts = TransactionOptions {
             force_hot: true,
             ..Default::default()
@@ -346,11 +355,9 @@ mod tests {
         let sg = SkewGuard::new(MemStorage::new(), Config::default());
         let range = crate::KeyRange::for_key(b"declared_key", 64);
 
-        // Make the range hot via conflicts.
         sg.monitor().record_conflict(range);
         sg.monitor().record_conflict(range);
 
-        // Transaction with declared_keys should detect hot range upfront.
         let opts = TransactionOptions {
             declared_keys: Some(vec![b"declared_key".to_vec()]),
             ..Default::default()
@@ -377,15 +384,12 @@ mod tests {
         let sg = SkewGuard::new(MemStorage::new(), config);
         let range = crate::KeyRange::for_key(b"credit_key", 64);
 
-        // Initially cold.
         assert_eq!(sg.monitor().mode(range), crate::RangeMode::Cold);
 
-        // 2 consecutive conflicts → hot.
         sg.monitor().record_conflict(range);
         sg.monitor().record_conflict(range);
         assert_eq!(sg.monitor().mode(range), crate::RangeMode::Hot);
 
-        // Many commits drain credits → cold.
         for _ in 0..50 {
             sg.monitor().record_commit(range);
         }
@@ -401,17 +405,14 @@ mod tests {
                 aimd_factor: 1,
             },
             num_ranges: 4,
-            ..Config::default()
         };
         let sg = SkewGuard::new(MemStorage::new(), config);
         let range = crate::KeyRange::for_key(b"hot_key", 4);
 
-        // Push to hot.
         sg.monitor().record_conflict(range);
         sg.monitor().record_conflict(range);
         assert_eq!(sg.monitor().mode(range), crate::RangeMode::Hot);
 
-        // Commit through hot path.
         let mut txn = sg.begin();
         txn.put(b"hot_key", b"credit_hot");
         txn.commit().unwrap();

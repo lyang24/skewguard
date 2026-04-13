@@ -8,11 +8,10 @@
 //! Runs on RocksDB (real I/O) when the `rocksdb` feature is enabled,
 //! otherwise falls back to MemStorage with simulated commit delay.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::rngs::SmallRng;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::SeedableRng;
-use skewguard::{ColdPathStrategy, Config, Error, MonitorStrategy, SkewGuard, Storage};
-use std::sync::atomic::{AtomicU64, Ordering};
+use rand::rngs::SmallRng;
+use skewguard::{Config, Error, MonitorStrategy, SkewGuard, Storage};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -126,7 +125,6 @@ fn run_workload<S: Storage>(
 
 fn config_pessimistic() -> Config {
     Config {
-        cold_path: ColdPathStrategy::Pessimistic,
         monitor_strategy: MonitorStrategy::Threshold {
             hot_threshold: 10.0,
             cold_threshold: 10.0,
@@ -140,7 +138,6 @@ fn config_pessimistic() -> Config {
 
 fn config_group_lock() -> Config {
     Config {
-        cold_path: ColdPathStrategy::Pessimistic,
         monitor_strategy: MonitorStrategy::Credit {
             initial_credit: i32::MAX,
             hotness_threshold: 0,
@@ -152,7 +149,6 @@ fn config_group_lock() -> Config {
 
 fn config_adaptive() -> Config {
     Config {
-        cold_path: ColdPathStrategy::Pessimistic,
         monitor_strategy: MonitorStrategy::Credit {
             initial_credit: 36,
             hotness_threshold: 2,
@@ -170,13 +166,9 @@ mod rocks_bench {
     use skewguard::rocks::RocksStorage;
     use tempfile::TempDir;
 
-    fn bench_rocks_mode(
-        c: &mut Criterion,
-        mode_name: &str,
-        config_fn: impl Fn() -> Config,
-    ) {
+    fn bench_rocks_mode(c: &mut Criterion, mode_name: &str, config_fn: impl Fn() -> Config) {
         let mut group = c.benchmark_group(format!("rocks_{mode_name}"));
-        group.throughput(Throughput::Elements(OPS_PER_THREAD as u64 * NUM_THREADS as u64));
+        group.throughput(Throughput::Elements(OPS_PER_THREAD * NUM_THREADS as u64));
 
         for &theta in &[0.6, 0.8, 0.9, 0.95, 0.99] {
             group.bench_with_input(
@@ -235,13 +227,9 @@ mod mem_bench {
 
     const COMMIT_DELAY: Duration = Duration::from_micros(50);
 
-    fn bench_mem_mode(
-        c: &mut Criterion,
-        mode_name: &str,
-        config_fn: impl Fn() -> Config,
-    ) {
+    fn bench_mem_mode(c: &mut Criterion, mode_name: &str, config_fn: impl Fn() -> Config) {
         let mut group = c.benchmark_group(format!("mem_{mode_name}"));
-        group.throughput(Throughput::Elements(OPS_PER_THREAD as u64 * NUM_THREADS as u64));
+        group.throughput(Throughput::Elements(OPS_PER_THREAD * NUM_THREADS as u64));
 
         for &theta in &[0.6, 0.8, 0.9, 0.95, 0.99] {
             group.bench_with_input(

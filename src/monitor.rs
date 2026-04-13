@@ -96,12 +96,8 @@ impl ContentionMonitor {
         let ranges = (0..num_ranges)
             .map(|_| Mutex::new(RangeState::new()))
             .collect();
-        let queue_depths = (0..num_ranges)
-            .map(|_| AtomicU32::new(0))
-            .collect();
-        let credits = (0..num_ranges)
-            .map(|_| AtomicI32::new(0))
-            .collect();
+        let queue_depths = (0..num_ranges).map(|_| AtomicU32::new(0)).collect();
+        let credits = (0..num_ranges).map(|_| AtomicI32::new(0)).collect();
         ContentionMonitor {
             ranges,
             queue_depths,
@@ -274,13 +270,13 @@ impl ContentionMonitor {
                     }
                 }
                 RangeMode::Hot => {
-                    if rate <= *cold_threshold {
-                        if let Some(since) = state.hot_since {
-                            let min = std::time::Duration::from_millis(*min_hot_duration_ms);
-                            if Instant::now().duration_since(since) >= min {
-                                state.mode = RangeMode::Cold;
-                                state.hot_since = None;
-                            }
+                    if rate <= *cold_threshold
+                        && let Some(since) = state.hot_since
+                    {
+                        let min = std::time::Duration::from_millis(*min_hot_duration_ms);
+                        if Instant::now().duration_since(since) >= min {
+                            state.mode = RangeMode::Cold;
+                            state.hot_since = None;
                         }
                     }
                 }

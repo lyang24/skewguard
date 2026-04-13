@@ -18,13 +18,7 @@ use crate::range::KeyRange;
 use crate::storage::{Storage, WriteBatch};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Default timeout for waiting on leadership handoff. If the current leader
-/// panics or hangs, followers will recover after this duration.
-const LEADER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A waiter in the key's handoff queue. The leader sends a message through
 /// this channel to wake the next follower.
@@ -33,36 +27,29 @@ struct Waiter {
     notify: std::sync::mpsc::SyncSender<()>,
 }
 
-/// RAII guard that ensures `release()` is called for every key the transaction
-/// acquired leadership on, even if the transaction panics mid-execution.
+/// RAII guard that ensures leadership is released for every key the transaction
+/// acquired, even if the transaction panics mid-execution.
 struct LeaderGuard<'a> {
     coordinator: &'a GroupLockCoordinator,
     keys: Vec<Vec<u8>>,
-    sequences: Vec<u64>,
     released: bool,
 }
 
 impl<'a> LeaderGuard<'a> {
-    fn new(coordinator: &'a GroupLockCoordinator, keys: Vec<Vec<u8>>, sequences: Vec<u64>) -> Self {
+    fn new(coordinator: &'a GroupLockCoordinator, keys: Vec<Vec<u8>>) -> Self {
         LeaderGuard {
             coordinator,
             keys,
-            sequences,
             released: false,
         }
     }
 
-    /// Explicitly release leadership and mark sequences committed.
-    /// Called on the normal (non-panic) path.
     fn release(mut self) {
         self.do_release();
         self.released = true;
     }
 
     fn do_release(&self) {
-        for &seq in &self.sequences {
-            self.coordinator.mark_committed(seq);
-        }
         for key in &self.keys {
             self.coordinator.release_key(key);
         }
@@ -72,7 +59,6 @@ impl<'a> LeaderGuard<'a> {
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
         if !self.released {
-            // Panic path: still release leadership so followers don't hang.
             self.do_release();
         }
     }
@@ -95,179 +81,144 @@ impl KeySlot {
     }
 }
 
-/// Coordinator for a single hot range using leader/follower handoff.
+/// Number of shards for the global key slot table. Independent hot keys
+/// hash to different shards and don't contend on the same mutex.
+const NUM_SLOT_SHARDS: usize = 256;
+
+/// Global key slot table shared by all coordinators, sharded to avoid
+/// a single-mutex bottleneck. Each shard is an independent Mutex<HashMap>.
 ///
-/// Non-conflicting keys within the range execute concurrently. Only
-/// transactions targeting the *same key* are serialized through the
-/// handoff mechanism.
-pub(crate) struct GroupLockCoordinator {
-    /// Per-key handoff slots.
-    slots: Mutex<HashMap<Vec<u8>, KeySlot>>,
-    /// Monotonic sequence counter for commit ordering within this range.
-    next_sequence: AtomicU64,
-    /// Highest sequence number that has been committed. Transactions must
-    /// wait for all predecessors to commit before committing themselves.
-    committed_through: AtomicU64,
+/// Keys are assigned to shards by FNV hash, so independent hot keys
+/// almost always land in different shards and don't contend.
+pub(crate) struct GlobalKeySlots {
+    shards: Vec<Mutex<HashMap<Vec<u8>, KeySlot>>>,
 }
 
-impl GroupLockCoordinator {
+impl GlobalKeySlots {
     pub fn new() -> Self {
-        GroupLockCoordinator {
-            slots: Mutex::new(HashMap::new()),
-            next_sequence: AtomicU64::new(0),
-            committed_through: AtomicU64::new(0),
+        GlobalKeySlots {
+            shards: (0..NUM_SLOT_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
         }
     }
 
-    /// Acquire leadership for a key. Returns immediately if no other
-    /// transaction holds leadership (caller becomes leader). Otherwise
-    /// blocks until the current leader hands off, or until the timeout
-    /// expires (indicating the leader likely crashed).
-    ///
-    /// Returns the assigned sequence number for commit ordering.
-    pub fn acquire(&self, key: &[u8]) -> u64 {
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+    fn shard_for(&self, key: &[u8]) -> &Mutex<HashMap<Vec<u8>, KeySlot>> {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in key {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        &self.shards[hash as usize % NUM_SLOT_SHARDS]
+    }
 
-        let receiver = {
-            let mut slots = self.slots.lock();
-            let slot = slots
-                .entry(key.to_vec())
-                .or_insert_with(KeySlot::new);
+    fn acquire_slot(&self, key: &[u8]) -> Option<std::sync::mpsc::Receiver<()>> {
+        let mut shard = self.shard_for(key).lock();
+        let slot = shard.entry(key.to_vec()).or_insert_with(KeySlot::new);
 
-            if !slot.has_leader {
-                // No leader — we become leader immediately.
-                slot.has_leader = true;
-                return seq;
-            }
+        if !slot.has_leader {
+            slot.has_leader = true;
+            return None;
+        }
 
-            // There's a leader. Enqueue ourselves and wait.
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            slot.waiters.push_back(Waiter { notify: tx });
-            rx
-        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slot.waiters.push_back(Waiter { notify: tx });
+        Some(rx)
+    }
 
-        // Wait outside the lock for the handoff signal, with a timeout
-        // to recover from leader crashes.
-        match receiver.recv_timeout(LEADER_TIMEOUT) {
-            Ok(()) => seq,
-            Err(_) => {
-                // Timeout or sender disconnected — the leader likely
-                // panicked or hung. Force-recover this key slot by
-                // clearing the dead leader and becoming the new leader.
-                self.force_recover(key);
-                seq
+    fn release_slot(&self, key: &[u8]) {
+        let mut shard = self.shard_for(key).lock();
+        if let Some(slot) = shard.get_mut(key) {
+            if let Some(next) = slot.waiters.pop_front() {
+                let _ = next.notify.send(());
+            } else {
+                slot.has_leader = false;
+                if slot.waiters.is_empty() {
+                    shard.remove(key);
+                }
             }
         }
     }
 
-    /// Force-recover a key slot when the current leader is presumed dead.
-    /// Clears any stale waiters whose senders have disconnected and
-    /// re-establishes leadership.
-    fn force_recover(&self, key: &[u8]) {
-        let mut slots = self.slots.lock();
-        if let Some(slot) = slots.get_mut(key) {
-            // Drain any waiters whose senders disconnected (their leaders
-            // also crashed). Try to wake the first live waiter.
+    fn force_recover_slot(&self, key: &[u8]) {
+        let mut shard = self.shard_for(key).lock();
+        if let Some(slot) = shard.get_mut(key) {
             while let Some(waiter) = slot.waiters.pop_front() {
                 if waiter.notify.send(()).is_ok() {
-                    // Successfully handed off to a live waiter.
                     return;
                 }
-                // Sender disconnected — this waiter's thread is gone. Skip it.
             }
-            // No live waiters remain. We already have leadership from the
-            // timed-out recv — just ensure the slot state is consistent.
             slot.has_leader = true;
         }
     }
+}
 
-    /// Release leadership for a key. If there are followers waiting,
-    /// hand off leadership to the next one (no lock release/acquire cycle).
-    /// If no followers are waiting, clean up the key slot.
-    fn release_key(&self, key: &[u8]) {
-        let mut slots = self.slots.lock();
-        if let Some(slot) = slots.get_mut(key) {
-            if let Some(next) = slot.waiters.pop_front() {
-                // Hand off to the next waiter. The lock is never released.
-                let _ = next.notify.send(());
-            } else {
-                // No waiters. Clean up the slot.
-                slot.has_leader = false;
-                // Remove the slot entirely if empty to prevent unbounded growth.
-                if slot.waiters.is_empty() {
-                    slots.remove(key);
-                }
-            }
-        }
+/// Coordinator for group locking with leader/follower handoff.
+///
+/// Uses a shared GlobalKeySlots table so that the same key is always
+/// coordinated through the same slot, even across different range
+/// coordinators.
+///
+/// There is no cross-key ordering. Transactions on independent keys within
+/// the same range execute and commit concurrently. Only same-key transactions
+/// are serialized through the handoff mechanism.
+pub(crate) struct GroupLockCoordinator {
+    global_slots: Arc<GlobalKeySlots>,
+}
+
+impl GroupLockCoordinator {
+    pub fn new(global_slots: Arc<GlobalKeySlots>) -> Self {
+        GroupLockCoordinator { global_slots }
     }
 
-    /// Wait until all transactions with sequence numbers before `seq` have
-    /// committed. This ensures commit ordering matches execution ordering.
+    /// Acquire leadership for a key. Blocks until leadership is handed off.
     ///
-    /// Times out after `LEADER_TIMEOUT` to avoid deadlocking if a predecessor
-    /// crashed without committing. On timeout, forces the watermark forward
-    /// so subsequent transactions can proceed.
-    pub fn wait_for_predecessors(&self, seq: u64) {
-        if seq <= 1 {
-            return; // First sequence, no predecessors.
-        }
+    /// If the current leader panics, its LeaderGuard Drop impl calls
+    /// release_key(), which sends the handoff signal. The follower wakes
+    /// up normally.
+    ///
+    /// There is NO timeout. A slow leader is not a dead leader.
+    pub fn acquire(&self, key: &[u8]) {
+        let receiver = match self.global_slots.acquire_slot(key) {
+            None => return, // Became leader immediately.
+            Some(rx) => rx,
+        };
 
-        let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
-        loop {
-            let committed = self.committed_through.load(Ordering::SeqCst);
-            if committed >= seq - 1 {
-                return;
+        match receiver.recv() {
+            Ok(()) => {}
+            Err(_) => {
+                // Sender dropped without sending — leader thread exited
+                // without triggering LeaderGuard::drop. Force-recover.
+                self.global_slots.force_recover_slot(key);
             }
-            if std::time::Instant::now() >= deadline {
-                // Predecessor likely crashed. Force the watermark forward
-                // so we (and everyone after us) can proceed.
-                self.committed_through.fetch_max(seq - 1, Ordering::SeqCst);
-                return;
-            }
-            std::thread::yield_now();
         }
     }
 
-    /// Mark a sequence number as committed, advancing the committed_through
-    /// watermark.
-    pub fn mark_committed(&self, seq: u64) {
-        // We only advance if seq is the next expected commit. This ensures
-        // strictly sequential commit ordering.
-        //
-        // In the current design, transactions on the same key execute
-        // serially so they always commit in order. But transactions on
-        // different keys within the same range can execute concurrently
-        // and may commit out of order. For now, we use a simple store.
-        // A more sophisticated approach would use a commit bitmap.
-        self.committed_through.fetch_max(seq, Ordering::SeqCst);
+    fn release_key(&self, key: &[u8]) {
+        self.global_slots.release_slot(key);
     }
 
     /// Execute a transaction's writes under group locking with handoff.
     ///
-    /// Uses a `LeaderGuard` to ensure leadership is released even if the
-    /// transaction panics mid-execution. This prevents follower deadlock
-    /// when a leader thread crashes (CIDER Section 4.6, fault tolerance).
-    pub fn execute<S: Storage>(
-        &self,
-        storage: &S,
-        rw_set: &ReadWriteSet,
-    ) -> Result<()> {
+    /// Per-key serialization via handoff. Independent keys execute and
+    /// commit concurrently — no cross-key ordering.
+    ///
+    /// Uses a LeaderGuard to ensure leadership is released on panic.
+    pub fn execute<S: Storage>(&self, storage: &S, rw_set: &ReadWriteSet) -> Result<()> {
         // Sort keys to prevent deadlock when a transaction touches multiple
         // hot keys (acquire in consistent order across transactions).
         let mut write_keys: Vec<Vec<u8>> = rw_set.writes.keys().cloned().collect();
         write_keys.sort();
 
-        // Acquire leadership on all keys. Each key's handoff is independent.
-        let sequences: Vec<u64> = write_keys
-            .iter()
-            .map(|key| self.acquire(key))
-            .collect();
+        // Acquire leadership on all keys.
+        for key in &write_keys {
+            self.acquire(key);
+        }
 
         // LeaderGuard ensures release happens even on panic.
-        let max_seq = sequences.iter().copied().max();
-        let guard = LeaderGuard::new(self, write_keys, sequences);
+        let guard = LeaderGuard::new(self, write_keys);
 
-        // We are now leader on all our keys. Build and apply the write batch.
+        // Build and apply the write batch.
         let mut batch = storage.write_batch();
         for (key, op) in &rw_set.writes {
             match op {
@@ -276,31 +227,28 @@ impl GroupLockCoordinator {
             }
         }
 
-        // Wait for predecessors to commit (preserves execution order).
-        if let Some(max_seq) = max_seq {
-            self.wait_for_predecessors(max_seq);
-        }
-
-        // Commit the writes.
         let result = storage.commit(batch);
 
-        // Release leadership on all keys (hands off to next waiter).
-        // On panic, the guard's Drop impl does this instead.
+        // Release leadership (hands off to next waiter per key).
         guard.release();
 
         result.map(|_| ())
     }
 }
 
-/// Registry of group lock coordinators, one per hot range.
+/// Registry of group lock coordinators. All coordinators share a single
+/// global key slot table, so the same key is always coordinated through
+/// the same slot regardless of which range handles the transaction.
 pub(crate) struct GroupLockRegistry {
     coordinators: Mutex<HashMap<usize, Arc<GroupLockCoordinator>>>,
+    global_slots: Arc<GlobalKeySlots>,
 }
 
 impl GroupLockRegistry {
     pub fn new() -> Self {
         GroupLockRegistry {
             coordinators: Mutex::new(HashMap::new()),
+            global_slots: Arc::new(GlobalKeySlots::new()),
         }
     }
 
@@ -308,7 +256,7 @@ impl GroupLockRegistry {
     pub fn coordinator(&self, range: KeyRange) -> Arc<GroupLockCoordinator> {
         let mut map = self.coordinators.lock();
         map.entry(range.index)
-            .or_insert_with(|| Arc::new(GroupLockCoordinator::new()))
+            .or_insert_with(|| Arc::new(GroupLockCoordinator::new(Arc::clone(&self.global_slots))))
             .clone()
     }
 
@@ -325,33 +273,30 @@ mod tests {
     use super::*;
     use crate::mem::MemStorage;
     use crate::storage::Storage;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     #[test]
     fn single_transaction_executes_immediately() {
-        let coord = GroupLockCoordinator::new();
+        let coord = GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new()));
         let storage = MemStorage::new();
 
         let mut rw_set = ReadWriteSet::new();
         let range = KeyRange { index: 0 };
-        rw_set.record_write(
-            b"key1".to_vec(),
-            range,
-            WriteOp::Put(b"value1".to_vec()),
-        );
+        rw_set.record_write(b"key1".to_vec(), range, WriteOp::Put(b"value1".to_vec()));
 
         coord.execute(&storage, &rw_set).unwrap();
 
-        let snap = storage.snapshot();
-        let val = crate::storage::Snapshot::get(&snap, b"key1").unwrap();
+        let val = storage
+            .get_at(b"key1", storage.current_timestamp())
+            .unwrap();
         assert_eq!(val, Some(b"value1".to_vec()));
     }
 
     #[test]
     fn concurrent_same_key_serialized() {
         // Two transactions on the same key should execute serially via handoff.
-        let coord = Arc::new(GroupLockCoordinator::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new())));
         let storage = Arc::new(MemStorage::new());
         let execution_order = Arc::new(Mutex::new(Vec::new()));
 
@@ -387,7 +332,7 @@ mod tests {
     #[test]
     fn concurrent_different_keys_parallel() {
         // Transactions on different keys should execute concurrently.
-        let coord = Arc::new(GroupLockCoordinator::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new())));
         let storage = Arc::new(MemStorage::new());
         let active_count = Arc::new(AtomicUsize::new(0));
         let max_concurrent = Arc::new(AtomicUsize::new(0));
@@ -426,10 +371,11 @@ mod tests {
         // With 8 different keys, we should see some concurrency.
         // (Not guaranteed on all platforms/schedulers, so we just check
         // all transactions completed.)
-        let snap = storage.snapshot();
         for i in 0..8 {
             let key = format!("key_{i}");
-            let val = crate::storage::Snapshot::get(&snap, key.as_bytes()).unwrap();
+            let val = storage
+                .get_at(key.as_bytes(), storage.current_timestamp())
+                .unwrap();
             assert_eq!(val, Some(b"value".to_vec()));
         }
     }
@@ -437,7 +383,7 @@ mod tests {
     #[test]
     fn handoff_preserves_last_writer_wins() {
         // Serial execution on same key: last writer's value should be visible.
-        let coord = Arc::new(GroupLockCoordinator::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new())));
         let storage = Arc::new(MemStorage::new());
 
         // Execute sequentially to guarantee order.
@@ -452,75 +398,60 @@ mod tests {
             coord.execute(&*storage, &rw_set).unwrap();
         }
 
-        let snap = storage.snapshot();
-        let val = crate::storage::Snapshot::get(&snap, b"counter").unwrap().unwrap();
+        let val = storage
+            .get_at(b"counter", storage.current_timestamp())
+            .unwrap()
+            .unwrap();
         assert_eq!(val, 4u32.to_le_bytes().to_vec());
     }
 
     #[test]
     fn slot_cleanup_after_no_waiters() {
-        let coord = GroupLockCoordinator::new();
+        let coord = GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new()));
         let storage = MemStorage::new();
 
         let mut rw_set = ReadWriteSet::new();
         let range = KeyRange { index: 0 };
-        rw_set.record_write(
-            b"temp_key".to_vec(),
-            range,
-            WriteOp::Put(b"val".to_vec()),
-        );
+        rw_set.record_write(b"temp_key".to_vec(), range, WriteOp::Put(b"val".to_vec()));
 
         coord.execute(&storage, &rw_set).unwrap();
 
         // After execution with no other waiters, the slot should be cleaned up.
-        let slots = coord.slots.lock();
-        assert!(!slots.contains_key(&b"temp_key".to_vec()));
+        let shard = coord.global_slots.shard_for(b"temp_key").lock();
+        assert!(!shard.contains_key(&b"temp_key".to_vec()));
     }
 
     #[test]
-    fn follower_recovers_from_leader_crash() {
-        // Simulate a leader crashing: acquire leadership on a key, then
-        // drop the coordinator reference without calling release. A follower
-        // waiting on the same key should recover via timeout.
-        let coord = Arc::new(GroupLockCoordinator::new());
+    fn follower_recovers_when_leader_panics() {
+        // When a leader thread panics inside execute(), LeaderGuard::drop
+        // releases leadership and the next follower wakes up normally.
+
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new())));
         let storage = Arc::new(MemStorage::new());
 
-        // Spawn a "leader" thread that acquires leadership and then panics
-        // without releasing. We catch the panic to avoid test failure.
-        let coord_clone = Arc::clone(&coord);
-        let leader = thread::spawn(move || {
-            let _seq = coord_clone.acquire(b"crash_key");
-            // Simulate work, then "crash" by returning without release.
-            // The LeaderGuard would normally handle this in execute(),
-            // but here we test the raw acquire/timeout path.
-            // Intentionally do NOT call release_key. The sender in the
-            // slot's waiter queue will be dropped, causing the follower's
-            // recv_timeout to fail.
-        });
-        leader.join().unwrap();
+        // Leader acquires and creates a guard, then "panics" (we simulate
+        // by dropping the guard without calling release).
+        {
+            let keys = vec![b"crash_key".to_vec()];
+            coord.acquire(b"crash_key");
+            let _guard = LeaderGuard::new(&coord, keys);
+            // Guard drops here → calls do_release → release_key → wakes next follower.
+        }
 
-        // Now spawn a follower. It should recover within LEADER_TIMEOUT.
-        let coord_clone = Arc::clone(&coord);
-        let storage_clone = Arc::clone(&storage);
-        let follower = thread::spawn(move || {
-            let mut rw_set = ReadWriteSet::new();
-            let range = KeyRange { index: 0 };
-            rw_set.record_write(
-                b"crash_key".to_vec(),
-                range,
-                WriteOp::Put(b"recovered".to_vec()),
-            );
-            coord_clone.execute(&*storage_clone, &rw_set).unwrap();
-        });
+        // A subsequent transaction should succeed immediately (leadership
+        // was released by the guard's Drop).
+        let mut rw_set = ReadWriteSet::new();
+        let range = KeyRange { index: 0 };
+        rw_set.record_write(
+            b"crash_key".to_vec(),
+            range,
+            WriteOp::Put(b"recovered".to_vec()),
+        );
+        coord.execute(&*storage, &rw_set).unwrap();
 
-        // The follower should complete within a reasonable time
-        // (LEADER_TIMEOUT + some margin).
-        let result = follower.join();
-        assert!(result.is_ok(), "follower should recover from leader crash");
-
-        // Verify the write landed.
-        let snap = storage.snapshot();
-        let val = crate::storage::Snapshot::get(&snap, b"crash_key").unwrap();
+        let val = storage
+            .get_at(b"crash_key", storage.current_timestamp())
+            .unwrap();
         assert_eq!(val, Some(b"recovered".to_vec()));
     }
 
@@ -528,14 +459,14 @@ mod tests {
     fn leader_guard_releases_on_panic() {
         // Test that LeaderGuard releases leadership when dropped (simulating
         // a panic during execute).
-        let coord = Arc::new(GroupLockCoordinator::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::new(GlobalKeySlots::new())));
         let storage = Arc::new(MemStorage::new());
 
         // Acquire and create a guard, then drop it without calling release().
         {
             let keys = vec![b"guard_key".to_vec()];
-            let sequences = vec![coord.acquire(b"guard_key")];
-            let _guard = LeaderGuard::new(&coord, keys, sequences);
+            coord.acquire(b"guard_key");
+            let _guard = LeaderGuard::new(&coord, keys);
             // guard drops here without explicit release()
         }
 
@@ -549,8 +480,114 @@ mod tests {
         );
         coord.execute(&*storage, &rw_set).unwrap();
 
-        let snap = storage.snapshot();
-        let val = crate::storage::Snapshot::get(&snap, b"guard_key").unwrap();
+        let val = storage
+            .get_at(b"guard_key", storage.current_timestamp())
+            .unwrap();
         assert_eq!(val, Some(b"after_drop".to_vec()));
+    }
+
+    #[test]
+    fn independent_hot_keys_commit_concurrently() {
+        // After removing cross-key sequence ordering, transactions on
+        // independent keys within the same coordinator must commit
+        // concurrently (no artificial convoying).
+        use std::sync::Barrier;
+
+        let slots = Arc::new(GlobalKeySlots::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::clone(&slots)));
+        let storage = Arc::new(MemStorage::new());
+        let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let coord = Arc::clone(&coord);
+                let storage = Arc::clone(&storage);
+                let bar = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    bar.wait(); // all start together
+
+                    // Each thread writes a unique key — no handoff contention.
+                    let key = format!("independent_{i}");
+                    let mut rw_set = ReadWriteSet::new();
+                    let range = KeyRange { index: 0 };
+                    rw_set.record_write(key.into_bytes(), range, WriteOp::Put(b"val".to_vec()));
+                    coord.execute(&*storage, &rw_set).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        // With no cross-key ordering, 8 threads writing 8 different keys
+        // should complete in roughly the time of 1 (parallel commits).
+        // If sequence ordering were still active, they'd serialize.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "8 independent keys took {:?}, suggesting serialization",
+            elapsed,
+        );
+
+        // Verify all writes landed.
+        for i in 0..num_threads {
+            let key = format!("independent_{i}");
+            let val = storage
+                .get_at(key.as_bytes(), storage.current_timestamp())
+                .unwrap();
+            assert_eq!(val, Some(b"val".to_vec()));
+        }
+    }
+
+    #[test]
+    fn follower_blocked_then_wakes_on_leader_drop() {
+        // Test the actual hard case: a follower is BLOCKED waiting on
+        // recv() when the leader's LeaderGuard drops. The follower
+        // must wake up and proceed.
+        let slots = Arc::new(GlobalKeySlots::new());
+        let coord = Arc::new(GroupLockCoordinator::new(Arc::clone(&slots)));
+        let storage = Arc::new(MemStorage::new());
+
+        // Thread 1: acquires leadership, holds it for a while, then
+        // drops the guard (simulating a panic or normal completion).
+        let coord1 = Arc::clone(&coord);
+        let t1 = thread::spawn(move || {
+            coord1.acquire(b"contested_key");
+            // Simulate some work while holding leadership.
+            thread::sleep(std::time::Duration::from_millis(50));
+            // Don't call release_key — rely on manual release to
+            // simulate what LeaderGuard::drop does.
+            coord1.release_key(b"contested_key");
+        });
+
+        // Give t1 a moment to acquire leadership.
+        thread::sleep(std::time::Duration::from_millis(10));
+
+        // Thread 2: tries to acquire the same key — should block
+        // until t1 releases.
+        let coord2 = Arc::clone(&coord);
+        let storage2 = Arc::clone(&storage);
+        let t2 = thread::spawn(move || {
+            let mut rw_set = ReadWriteSet::new();
+            let range = KeyRange { index: 0 };
+            rw_set.record_write(
+                b"contested_key".to_vec(),
+                range,
+                WriteOp::Put(b"from_follower".to_vec()),
+            );
+            coord2.execute(&*storage2, &rw_set).unwrap();
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Follower's write should have succeeded after leader released.
+        let val = storage
+            .get_at(b"contested_key", storage.current_timestamp())
+            .unwrap();
+        assert_eq!(val, Some(b"from_follower".to_vec()));
     }
 }

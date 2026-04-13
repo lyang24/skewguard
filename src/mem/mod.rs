@@ -9,16 +9,17 @@ use std::time::Duration;
 
 /// In-memory MVCC storage. Each key stores a history of (timestamp, value) pairs.
 ///
-/// Supports an optional commit delay to simulate fsync cost. Without the delay,
-/// aborts are essentially free (retry is instant), hiding the difference between
-/// pessimistic locking and group locking. With even a small delay (10-50μs),
-/// wasted work from aborted transactions becomes measurable.
+/// Timestamp contract:
+/// - `snapshot()` returns timestamp T (current clock).
+/// - `commit()` increments the clock and writes at T+1.
+/// - `get_at(key, T)` returns the latest version with `version_ts < T`.
+/// - This ensures snapshots never see concurrent or future commits.
+///
+/// Supports an optional commit delay to simulate fsync cost.
 pub struct MemStorage {
-    /// key -> [(timestamp, Option<value>)], sorted by timestamp.
-    /// None value means a delete at that timestamp.
+    #[allow(clippy::type_complexity)]
     data: RwLock<BTreeMap<Vec<u8>, Vec<(Timestamp, Option<Vec<u8>>)>>>,
     clock: AtomicU64,
-    /// Simulated commit latency (e.g., fsync). Applied on every `commit()` call.
     commit_delay: Option<Duration>,
 }
 
@@ -32,8 +33,6 @@ impl MemStorage {
     }
 
     /// Create a MemStorage with simulated commit delay.
-    /// Even 10μs makes aborted transactions expensive enough to show the
-    /// difference between CC strategies.
     pub fn with_commit_delay(delay: Duration) -> Self {
         MemStorage {
             data: RwLock::new(BTreeMap::new()),
@@ -43,6 +42,9 @@ impl MemStorage {
     }
 
     fn tick(&self) -> Timestamp {
+        // Returns the OLD value of the clock, then increments.
+        // So if clock was 1: write at ts=1, clock becomes 2.
+        // current_timestamp() returns 2, get_at(key, 2) sees writes at ts < 2 = ts=1. Correct.
         self.clock.fetch_add(1, Ordering::SeqCst)
     }
 }
@@ -59,8 +61,7 @@ impl storage::Storage for MemStorage {
 
     fn snapshot(&self) -> MemSnapshot {
         let ts = self.clock.load(Ordering::SeqCst);
-        let data = self.data.read().clone();
-        MemSnapshot { data, ts }
+        MemSnapshot { ts }
     }
 
     fn write_batch(&self) -> MemWriteBatch {
@@ -68,11 +69,9 @@ impl storage::Storage for MemStorage {
     }
 
     fn commit(&self, batch: MemWriteBatch) -> Result<Timestamp> {
-        // Simulate fsync/write latency.
         if let Some(delay) = self.commit_delay {
             std::thread::sleep(delay);
         }
-
         let ts = self.tick();
         let mut data = self.data.write();
         for (key, value) in batch.ops {
@@ -88,8 +87,9 @@ impl storage::Storage for MemStorage {
     fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<Vec<u8>>> {
         let data = self.data.read();
         if let Some(history) = data.get(key) {
+            // Return latest version strictly before ts.
             for &(version_ts, ref value) in history.iter().rev() {
-                if version_ts <= ts {
+                if version_ts < ts {
                     return Ok(value.clone());
                 }
             }
@@ -110,24 +110,12 @@ impl storage::Storage for MemStorage {
     }
 }
 
-/// A snapshot of the in-memory storage at a point in time.
+/// Snapshot: just a timestamp. Reads go through Storage::get_at().
 pub struct MemSnapshot {
-    data: BTreeMap<Vec<u8>, Vec<(Timestamp, Option<Vec<u8>>)>>,
     ts: Timestamp,
 }
 
 impl storage::Snapshot for MemSnapshot {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(history) = self.data.get(key) {
-            for &(version_ts, ref value) in history.iter().rev() {
-                if version_ts <= self.ts {
-                    return Ok(value.clone());
-                }
-            }
-        }
-        Ok(None)
-    }
-
     fn timestamp(&self) -> Timestamp {
         self.ts
     }
@@ -151,7 +139,7 @@ impl storage::WriteBatch for MemWriteBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
+    use crate::storage::{Snapshot, Storage};
 
     #[test]
     fn basic_read_write() {
@@ -160,48 +148,46 @@ mod tests {
         storage::WriteBatch::put(&mut batch, b"hello", b"world");
         store.commit(batch).unwrap();
 
-        let snap = store.snapshot();
-        let val = storage::Snapshot::get(&snap, b"hello").unwrap();
+        let ts = store.current_timestamp();
+        let val = store.get_at(b"hello", ts).unwrap();
         assert_eq!(val, Some(b"world".to_vec()));
     }
 
     #[test]
-    fn snapshot_isolation() {
+    fn snapshot_does_not_see_concurrent_writes() {
         let store = MemStorage::new();
 
-        // Write v1
+        // Write v1.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"v1");
         store.commit(batch).unwrap();
 
-        // Take snapshot
+        // Take snapshot.
         let snap = store.snapshot();
+        let snap_ts = snap.timestamp();
 
-        // Write v2 after snapshot
+        // Write v2 after snapshot.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"v2");
         store.commit(batch).unwrap();
 
-        // Snapshot still sees v1
-        let val = storage::Snapshot::get(&snap, b"key").unwrap();
+        // Snapshot sees v1, not v2.
+        let val = store.get_at(b"key", snap_ts).unwrap();
         assert_eq!(val, Some(b"v1".to_vec()));
 
-        // Fresh snapshot sees v2
-        let snap2 = store.snapshot();
-        let val2 = storage::Snapshot::get(&snap2, b"key").unwrap();
-        assert_eq!(val2, Some(b"v2".to_vec()));
+        // Current timestamp sees v2.
+        let val = store.get_at(b"key", store.current_timestamp()).unwrap();
+        assert_eq!(val, Some(b"v2".to_vec()));
     }
 
     #[test]
     fn was_modified_detection() {
         let store = MemStorage::new();
 
-        // Write v0 to establish a baseline timestamp.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"other_key", b"v0");
         let ts1 = store.commit(batch).unwrap();
 
-        // Write key after ts1.
         let mut batch = store.write_batch();
         storage::WriteBatch::put(&mut batch, b"key", b"v1");
         let ts2 = store.commit(batch).unwrap();
